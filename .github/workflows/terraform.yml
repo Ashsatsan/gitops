@@ -1,0 +1,115 @@
+name: "GitOps Terraform"
+
+on:
+  push:
+    branches:
+      - main
+      - stage
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  BUCKET_TF_STATE: ${{ secrets.BUCKET_TF_STATE }}
+  REGISTRY: ${{ secrets.REGISTRY }}
+  EKS_CLUSTER: vprofile1-eks
+  REGION: us-east-2
+
+jobs:
+  terraform:
+    name: "Apply Terraform Code Changes"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./terraform
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform with specified version on the runner
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.6.3
+
+          cli_config_credentials_path: ${{ github.workspace }}/.terraformrc
+
+
+      - name: Verify Terraform version
+        run: terraform version
+
+      - name: Terraform init
+        id: init
+        run: terraform init -backend-config="bucket=${{ env.BUCKET_TF_STATE }}"
+
+      - name: Terraform format (auto-fix)
+        run: terraform fmt
+
+      - name: Terraform format
+        id: fmt
+        run: terraform fmt -check
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate
+
+      - name: Terraform destroy (optional step to destroy resources)
+        id: destroy
+        run: |
+          if [ $GITHUB_REF == "refs/heads/main" ] && [ $GITHUB_EVENT_NAME == "workflow_dispatch" ]; then
+            echo "Running terraform destroy"
+            terraform destroy -auto-approve
+          else
+            echo "Skipping destroy on non-main branch or non-manual trigger"
+          fi
+        if: success()
+
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform plan status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform apply (only for the main)
+        id: apply
+        run: |
+          if [ $GITHUB_REF == "refs/heads/main" ] && [ $GITHUB_EVENT_NAME == "push" ]; then
+            terraform apply -auto-approve tfplan
+          else
+            echo "Skipping apply on non-main branch"
+          fi
+        if: success()
+
+
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.REGION }}
+
+      - name: Configure AWS CLI for kubectl
+        if: steps.plan.outcome == 'success' # Automatically uses success of previous steps
+        id: kubeconfig
+        run: |
+          if [ $GITHUB_REF == "refs/heads/main" ]; then
+            aws eks --region ${{ env.REGION }} update-kubeconfig --name ${{ env.EKS_CLUSTER }}
+          else
+            echo "Skipping EKS kubectl configuration on non-main branch"
+          fi
+
+      #- name: Download and install the ingress controller
+       # if: steps.plan.outcome == 'success' && steps.kubeconfig.outcome == 'success'
+       # run: |
+          #if [ $GITHUB_REF == "refs/heads/main" ]; then
+          #  kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml
+         # else
+         #   echo "Skipping ingress controller installation on non-main branch"
+          #fi
